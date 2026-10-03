@@ -1,0 +1,52 @@
+name: Sync upstream and mirror releases
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: Genymobile/scrcpy
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fast-forward default branch to upstream
+        # Non-fatal: fails harmlessly if upstream changed workflow files
+        # or if local commits would be overwritten.
+        continue-on-error: true
+        run: |
+          BRANCH=$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef --jq .defaultBranchRef.name)
+          gh api -X POST "repos/$GITHUB_REPOSITORY/merge-upstream" -f branch="$BRANCH"
+
+      - name: Mirror new upstream releases (latest 5 stable)
+        run: |
+          set -euo pipefail
+          gh api "repos/$UPSTREAM/releases?per_page=20" \
+            --jq '[.[] | select(.draft==false and .prerelease==false)][:5][] | .tag_name' |
+          while read -r TAG; do
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "$TAG already mirrored"; continue
+            fi
+            echo "Mirroring $TAG"
+            DIR=$(mktemp -d)
+            gh release download "$TAG" --repo "$UPSTREAM" --dir "$DIR"
+            curl -fsSL -o "$DIR/scrcpy-$TAG-source.tar.gz" "https://github.com/$UPSTREAM/archive/refs/tags/$TAG.tar.gz"
+            curl -fsSL -o "$DIR/scrcpy-$TAG-source.zip" "https://github.com/$UPSTREAM/archive/refs/tags/$TAG.zip"
+            # Verify checksums when upstream publishes them
+            if [ -f "$DIR/SHA256SUMS.txt" ]; then
+              (cd "$DIR" && sha256sum --ignore-missing -c SHA256SUMS.txt)
+            fi
+            # Pin the tag to the exact upstream commit (objects are shared in the fork network)
+            SHA=$(gh api "repos/$UPSTREAM/commits/$TAG" --jq .sha)
+            gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$SHA" >/dev/null 2>&1 || true
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "Backup of $UPSTREAM $TAG" --latest=false \
+              --notes "Backup mirror of https://github.com/$UPSTREAM/releases/tag/$TAG (Apache-2.0). Unmodified upstream assets plus source archives from the upstream tag." \
+              "$DIR"/*
+          done
